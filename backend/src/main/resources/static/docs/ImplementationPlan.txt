@@ -1,0 +1,824 @@
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+Order-to-Audit System: Backend 
+Architecture, ER Diagram and API Guide
+Prepared for Noufal | NIT Tiruchirappalli CDI winter internship task | Spring Boot +
+MySQL, kept simple on purpose
+
+1. How this design earns the marks
+The brief says business modelling beats feature count, and 65% of the weight sits in four
+things: benchmark numbers (30), production/inventory design (20), sales-to-invoice flow
+(15), data model and code quality (15). The design below is shaped around those.
+
+Criterion (weight) What the design does about it
+
+Benchmark correctness (30%) Every section 5 number is traced through the
+ledger in section 9. A Flyway seed script plus one
+integration test replays steps 1-9 and asserts the
+results table.
+
+Production and inventory (20%) Insert-only stock ledger, BOM with planned vs
+actual run lines, a Unit enum for conversions,
+variance computed in one place.
+
+Sales-to-invoice (15%) Order, approve (stock check), invoice (GST),
+dispatch (ledger out): four endpoints, four
+statuses, no hidden side effects.
+
+Model and code quality (15%) 18 tables, package-by-feature, thin controllers, unit
+tests on tax, units, variance and ledger.
+
+Usability (10%) Salesman flow is 3 calls: customers, items, submit
+order. Order submit is idempotent so a retry on
+weak network never duplicates.
+
+Reports and docs (10%) One report pattern: same endpoint, format = json,
+csv, xlsx or pdf.
+
+Mental model to hold onto (and to say in the interview): the stock ledger is a bank
+passbook. Nobody edits the balance. Every business event only adds passbook lines, and
+the balance is whatever the lines add up to. Purchase, production and dispatch are just
+
+Page 1 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+three rules for which lines to write. This single idea covers ledger-based stock,
+traceability and audit together.
+
+2. Five design rules
+1. Balance = SUM of ledger. No balance column anywhere that a person or a bug can
+
+overwrite.
+2. Exact arithmetic. BigDecimal in Java, DECIMAL in MySQL: money 2 dp, rates 4 dp,
+
+quantities 3 dp. Rounding is HALF_UP, done once per line, and written in the README.
+Why not integer paise? Rates like Rs 45 per kg become fractions of a paisa per gram,
+so DECIMAL with an explicit scale is clearer and safer.
+
+3. One stock unit per item (kg, L or pcs). Anything entered in g or ml is converted on the
+way in by a Unit enum, so the ledger only ever holds the stock unit. Cartons are not a
+unit: a carton is a packaging item, and finished packets per carton is a column on the
+item.
+
+4. Posted documents are frozen. An invoice is cancelled with a credit note, never
+deleted. Edits write audit_log with user, time, old and new JSON.
+
+5. One door to the ledger. Only StockService.post() writes ledger rows. Every other
+service calls it.
+
+3. Stack (and the 3-sentence justification for your README)
+Java 21, Spring Boot 3, Spring Data JPA, MySQL 8, Spring Security with JWT, Flyway,
+OpenPDF (PDF), OpenCSV and Apache POI (CSV/Excel), JUnit 5 with Testcontainers
+(or H2 in MySQL mode), Docker Compose.
+Frontend: a responsive PWA or simple React app that only consumes this API. The
+salesman screens are mobile-first.
+README wording: We chose a Spring Boot monolith on MySQL because the problem
+is transactional: a dispatch or production run must change several tables atomically,
+and a relational database with transactions gives that for free. A single deployable
+keeps setup to one docker compose command. JWT roles map directly to the five
+users in the brief.
+
+Package layout (package by feature, not by layer):
+
+Page 2 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+com.factory
+  auth/        JWT filter, login, users
+  master/      item, customer, supplier, bom
+  stock/       LedgerEntry, StockService, Unit, stock queries
+  purchase/
+  production/  run, run lines, variance, overheads
+  sales/       order, invoice, dispatch, payment, creditnote
+  costing/     CostingService
+  report/      one query class per report + exporters
+  audit/       AuditService
+  common/      error handling, DocSequence, Money utils
+
+Inside each package: Controller (parse and authorise) -> Service (all rules,
+@Transactional) -> Repository. Controllers never contain logic.
+
+4. ER diagram
+Paste the block below into the README or design note. GitHub and GitLab render
+mermaid natively. Two helper tables are left out of the picture to keep it readable:
+settings(key, value)  for variance tolerance, factory state code and shelf-life defaults,
+
+and doc_sequences(doc_type, fy, last_no)  for gap-free numbering.
+
+erDiagram
+  USERS ||--o{ ORDERS : places
+  USERS ||--o{ AUDIT_LOG : acts
+  CUSTOMERS ||--o{ ORDERS : receives
+  CUSTOMERS ||--o{ INVOICES : billed
+  ORDERS ||--|{ ORDER_LINES : has
+  ITEMS ||--o{ ORDER_LINES : ordered
+  ORDERS ||--o| INVOICES : billed_as
+  INVOICES ||--|{ INVOICE_LINES : has
+  ITEMS ||--o{ INVOICE_LINES : billed_item
+  INVOICES ||--o| DISPATCHES : shipped_by
+  INVOICES ||--o{ PAYMENTS : paid_by
+  INVOICES ||--o| CREDIT_NOTES : cancelled_by
+  SUPPLIERS ||--o{ PURCHASES : supplies
+  PURCHASES ||--|{ PURCHASE_LINES : has
+  ITEMS ||--o{ PURCHASE_LINES : bought
+  BOMS ||--|{ BOM_LINES : has
+  ITEMS ||--o{ BOM_LINES : ingredient
+  BOMS ||--o{ ITEMS : makes
+
+Page 3 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+  ITEMS ||--o{ PRODUCTION_RUNS : produced_in
+  PRODUCTION_RUNS ||--|{ RUN_LINES : has
+  ITEMS ||--o{ RUN_LINES : consumed
+  PRODUCTION_RUNS ||--o{ RUN_OVERHEADS : incurs
+  ITEMS ||--o{ STOCK_LEDGER : moves
+
+  USERS { bigint id PK string username UK string password_hash string role 
+boolean active }
+  CUSTOMERS { bigint id PK string name string type string gstin string 
+state_code string phone }
+  ITEMS { bigint id PK string code UK string name string item_type string 
+stock_unit string hsn_code decimal gst_rate decimal selling_price decimal 
+avg_cost int pack_size_g int packs_per_carton decimal reorder_level bigint 
+bom_id FK }
+  SUPPLIERS { bigint id PK string name string gstin string phone }
+  PURCHASES { bigint id PK string purchase_no UK bigint supplier_id FK date 
+purchase_date string supplier_bill_no bigint created_by FK }
+  PURCHASE_LINES { bigint id PK bigint purchase_id FK bigint item_id FK 
+decimal qty decimal rate decimal amount }
+  BOMS { bigint id PK string name int yield_packets int ref_pack_g decimal 
+tolerance_pct }
+  BOM_LINES { bigint id PK bigint bom_id FK bigint item_id FK decimal 
+qty_per_batch }
+  PRODUCTION_RUNS { bigint id PK string run_no UK bigint product_id FK 
+decimal batches int expected_output int actual_output int wastage_pcs decimal 
+yield_variance_pct boolean yield_flagged string status date run_date string 
+batch_no bigint created_by FK }
+  RUN_LINES { bigint id PK bigint run_id FK bigint item_id FK decimal 
+planned_qty decimal actual_qty decimal variance_pct boolean flagged }
+  RUN_OVERHEADS { bigint id PK bigint run_id FK string type decimal amount 
+string note }
+  STOCK_LEDGER { bigint id PK bigint item_id FK date movement_date string 
+movement_type decimal qty_delta decimal unit_cost string source_type bigint 
+source_id bigint created_by FK timestamp created_at }
+  ORDERS { bigint id PK string order_no UK string client_uuid UK bigint 
+customer_id FK bigint salesman_id FK string status string note bigint 
+decided_by FK timestamp created_at }
+  ORDER_LINES { bigint id PK bigint order_id FK bigint item_id FK int 
+ordered_qty int approved_qty decimal unit_price }
+  INVOICES { bigint id PK string invoice_no UK bigint order_id FK bigint 
+customer_id FK date invoice_date string supply_type string place_of_supply 
+string customer_gstin decimal taxable_value decimal cgst decimal sgst decimal 
+igst decimal total string status }
+
+Page 4 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+  INVOICE_LINES { bigint id PK bigint invoice_id FK bigint item_id FK string 
+hsn_code int qty decimal rate decimal taxable_value decimal gst_rate decimal 
+cgst decimal sgst decimal igst decimal line_total }
+  DISPATCHES { bigint id PK bigint invoice_id FK date dispatch_date bigint 
+dispatched_by FK }
+  PAYMENTS { bigint id PK bigint invoice_id FK decimal amount date paid_on 
+string mode string reference bigint received_by FK }
+  CREDIT_NOTES { bigint id PK string cn_no UK bigint invoice_id FK string 
+reason decimal taxable_value decimal cgst decimal sgst decimal igst decimal 
+total bigint created_by FK }
+  AUDIT_LOG { bigint id PK string entity_type bigint entity_id string action 
+string old_json string new_json bigint user_id FK timestamp at }
+
+Why it is shaped this way
+One ITEMS table for raw, packaging and finished goods (item_type column). The
+ledger then needs just one item_id, and stock summary is one query with a filter.
+BOMS is separate from ITEMS and items.bom_id points to it. That is what lets two
+pack sizes share one recipe later (see section 12).
+STOCK_LEDGER.source_type + source_id is the traceability link (PURCHASE,
+PRODUCTION_RUN, INVOICE, CREDIT_NOTE, ADJUSTMENT). It is a polymorphic
+reference, so it is not a database FK. Index on (item_id, movement_date) and
+(source_type, source_id).
+Snapshots on invoice lines (rate, HSN, GST rate, customer GSTIN): editing a master
+later never changes a posted invoice.
+Movement types and sign: OPENING +, PURCHASE +, PROD_ISSUE -,
+PROD_OUTPUT +, SALE_DISPATCH -, SALE_RETURN +, ADJUSTMENT +/-.
+Status flows: Order SUBMITTED -> APPROVED -> INVOICED -> DISPATCHED (or
+SUBMITTED -> REJECTED). Invoice POSTED -> CANCELLED. Run DRAFT -> ISSUED -
+> COMPLETED.
+
+5. Roles
+
+Role Allowed
+
+SALESMAN Read customers and items with prices. Create
+orders. Read own orders, status and customer-
+wise sales.
+
+Page 5 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+Role Allowed
+
+ADMIN Masters, order approval, invoices, dispatch,
+payments, users. Read stock, production and
+reports.
+
+PRODUCTION Purchases, production runs, stock adjustments.
+Read items, BOM, stock.
+
+ACCOUNTANT Read-only: invoices, payments, all reports and
+exports.
+
+OWNER Dashboard plus all reports, read-only.
+
+Implement with @PreAuthorize(hasRole(...))  on controller methods, and filter
+salesman queries by the logged-in user id inside the service (not in the controller).
+
+6. API conventions
+Base path /api , JSON, Authorization: Bearer <jwt> . Dates ISO (2026-11-25).
+Quantities in requests carry a unit, e.g. {itemId: 3, qty: 10500, unit: ML} . The
+server converts to the item stock unit.
+Error body: {timestamp, status, error, message, details[]} . Codes: 400
+validation, 401 not logged in, 403 wrong role, 404 not found, 409 business-rule conflict
+(insufficient stock, wrong status, overpayment).
+Lists accept page , size . Reports accept from , to , format .
+Examples below use loose JSON without quotes to save space; real requests use
+normal JSON.
+
+7. Endpoint catalogue
+Auth and users
+
+Page 6 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+Method Path Role Purpose
+
+POST /auth/login public username, password -> {token, role, name}
+
+GET /auth/me any current user
+
+POST, GET /users ADMIN create and list users, set role, deactivate
+
+Masters
+
+Method Path Role Purpose
+
+GET, /items? GET: all, write: item master
+POST, type=RAW,PACKAGING,FINISHED ADMIN/PRODUCTION with unit,
+PUT HSN, GST
+
+rate, price
+
+GET, /customers GET: ADMIN, name, type,
+POST, SALESMAN. write: GSTIN, state
+PUT ADMIN code
+
+GET, /suppliers ADMIN, PRODUCTION supplier
+POST master
+
+GET, /boms write: ADMIN, BOM header
+POST, PRODUCTION + lines (qty
+PUT per batch,
+
+yield)
+
+GET, /settings ADMIN tolerance %,
+PUT factory state
+
+code
+
+Sales
+
+Method Path Role Purpose
+
+POST /orders SALESMAN submit {clientUuid,
+customerId, lines[]};
+replay returns the same
+order
+
+Page 7 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+Method Path Role Purpose
+
+GET /orders?status= SALESMAN (own), list with status
+ADMIN (all)
+
+GET /orders/{id} same detail with lines
+
+GET /orders/{id}/stock-check ADMIN per line: requested,
+available, shortage
+
+PUT /orders/{id} ADMIN edit qty or price while
+SUBMITTED (audited)
+
+POST /orders/{id}/approve ADMIN body {allowBackorder} ->
+APPROVED
+
+POST /orders/{id}/reject ADMIN body {reason}
+
+POST /orders/{id}/invoice ADMIN APPROVED order ->
+POSTED GST invoice
+
+GET /invoices, /invoices/{id} ADMIN, list, detail
+ACCOUNTANT
+
+GET /invoices/{id}/pdf ADMIN, PDF download
+ACCOUNTANT
+
+GET /invoices/{id}/share-link ADMIN returns wa.me link with
+PDF URL
+
+POST /invoices/{id}/dispatch ADMIN ledger out, order
+DISPATCHED
+
+POST /invoices/{id}/cancel ADMIN body {reason}; credit note
++ stock reversal
+
+POST /payments ADMIN {invoiceId, amount, mode,
+paidOn, reference}
+
+GET /customers/{id}/outstanding ADMIN, invoices, paid, balance,
+ACCOUNTANT ageing
+
+GET /salesman/me/customer- SALESMAN own sales grouped by
+sales customer
+
+Purchase, production, stock
+
+Page 8 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+Method Path Role Purpose
+
+POST, /purchases PRODUCTION (write) purchase with lines;
+GET ledger in; avg cost
+
+updated
+
+POST /production-runs PRODUCTION {productId, batches,
+runDate} -> DRAFT with
+planned lines
+
+POST /production- PRODUCTION raw materials issued;
+runs/{id}/issue ledger out
+
+POST /production- PRODUCTION {actualOutput,
+runs/{id}/complete wastagePcs,
+
+packagingUsed[]}
+
+POST /production- PRODUCTION {type: LABOUR or
+runs/{id}/overheads GAS_POWER or OTHER,
+
+amount}
+
+GET /production-runs, PRODUCTION, ADMIN, planned vs actual,
+/production-runs/{id} OWNER, variance, flags, costing
+
+ACCOUNTANT
+
+GET /stock?type= production, admin, balance per item (SUM of
+owner, accountant ledger)
+
+GET /stock/ledger? same every movement with
+itemId&from&to source
+
+POST /stock/adjustments PRODUCTION, ADMIN {itemId, qty, reason}
+audited, reason
+mandatory
+
+Reports and dashboard (ACCOUNTANT, OWNER, ADMIN; all take from, to, format)
+/reports/sales-register , /reports/customer-sales , /reports/product-sales ,
+/reports/gst-summary , /reports/purchase-register , /reports/stock-summary ,
+/reports/stock-ledger , /reports/production , /reports/collections ,
+/reports/outstanding  (with ageing), GET /dashboard  (OWNER: today's orders, stock
+
+levels, flagged runs, latest cost per packet, total outstanding), GET /audit?
+entityType&entityId  (ADMIN, ACCOUNTANT).
+
+Page 9 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+8. Core API logic (read these until you can explain them without 
+looking)
+
+8.1 Unit conversion
+
+enum Unit { // dimension, factor to the dimension base (kg, L, pcs)
+  KG(MASS,1), G(MASS,0.001), L(VOLUME,1), ML(VOLUME,0.001), PCS(COUNT,1), 
+PACKET(COUNT,1);
+}
+BigDecimal toStockUnit(BigDecimal qty, Unit entered, Item item) {
+  if (entered.dimension != item.stockUnit.dimension) throw new 
+BadRequest(unit mismatch);
+  return qty.multiply(entered.factor).divide(item.stockUnit.factor, 3, 
+HALF_UP);
+}
+// 10500 ML on an item stored in L -> 10.500
+
+8.2 StockService.post (the only door to the ledger)
+
+@Transactional(propagation = MANDATORY)      // must run inside the caller's 
+transaction
+LedgerEntry post(Item item, MovementType type, BigDecimal delta, BigDecimal 
+unitCost,
+                 SourceType src, Long srcId, LocalDate date) {
+  itemRepo.lockById(item.getId());           // SELECT ... FOR UPDATE: two 
+dispatches cannot both pass the check
+  BigDecimal bal = ledgerRepo.sumDelta(item.getId());
+  if (delta.signum() < 0 && bal.add(delta).signum() < 0)
+      throw new InsufficientStockException(item, bal, delta.negate());   // -
+> HTTP 409
+  return ledgerRepo.save(new LedgerEntry(item, date, type, delta, unitCost, 
+src, srcId, currentUser()));
+}
+
+Because every business action calls this inside one @Transactional method, a failure
+halfway (for example the third material is short) rolls back the first two ledger rows. That
+is the answer to 'what if it crashes midway' in the interview.
+
+Page 10 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+8.3 Purchase (weighted average cost)
+
+for (line : request.lines) {
+  qty = toStockUnit(line.qty, line.unit, item);
+  before = stock.balance(item);
+  newAvg = before.multiply(item.avgCost).add(qty.multiply(line.rate))
+             .divide(before.add(qty), 4, HALF_UP);
+  stock.post(item, PURCHASE, qty, line.rate, PURCHASE, purchase.id, date);
+  item.setAvgCost(newAvg);   // flour: (100*42 + 60*45)/160 = 43.1250
+}
+
+Costing method to state: perpetual weighted average. Chosen over FIFO because a small
+factory mixes batches of flour in one bin, so layer tracking would pretend a precision that
+does not exist. Last price is too jumpy for a margin report. Every issue ledger row stores
+the unit_cost used, so any cost is re-derivable.
+
+8.4 Production run (the heart of the marking)
+Create (status DRAFT): for each BOM line, planned_qty = qty_per_batch x batches;
+expected_output = yield_packets x batches. Insert RUN_LINES with actual_qty = 0. No
+stock moves yet.
+Issue (DRAFT or ISSUED): for each requested item, convert unit, stock.post(item,
+PROD_ISSUE, -qty, item.avgCost, PRODUCTION_RUN, run.id) , add to the run line
+actual_qty. A material not in the BOM is allowed but creates a new run line with planned 0
+(extra issue), which shows as flagged.
+Complete (ISSUED only):
+
+Page 11 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+for (p : packagingUsed)                       // pouches 194, cartons 9
+  stock.post(p.item, PROD_ISSUE, -p.qty, p.item.avgCost, PRODUCTION_RUN, 
+run.id);  // and run line actual += qty
+stock.post(product, PROD_OUTPUT, +actualOutput, runUnitCost, PRODUCTION_RUN, 
+run.id);
+run.actualOutput = actualOutput; run.wastagePcs = wastagePcs;
+
+tol = settings.tolerancePct;                  // 3.00
+for (line : run.lines) {
+  pct = (actual - planned) / planned * 100, scale 2, HALF_UP;
+  line.flagged = pct.abs() > tol;             // strictly greater: exactly 
+3.00 is not flagged
+}
+run.yieldVariancePct = (actualOutput - expected) / expected * 100;   // (188-
+200)/200 = -6.00
+run.yieldFlagged = run.yieldVariancePct.abs() > tol;
+run.status = COMPLETED; audit.log(...);
+
+runUnitCost  for finished goods = material cost / actualOutput at completion. It is only for
+stock valuation; the final cost per packet (with overheads) is calculated in 8.5.
+
+8.5 Costing (computed on read, never stored)
+
+materialCost = SUM(-qty_delta * unit_cost) of ledger rows where source = this 
+run and type = PROD_ISSUE
+overhead     = SUM(run_overheads.amount)
+costPerPacket = (materialCost + overhead) / actualOutput      -> 4 dp 
+internally, shown 2 dp HALF_UP
+margin        = sellingPrice - costPerPacket;  margin% = margin / 
+sellingPrice
+
+Rules to write down: (a) all cost of the run, including the 6 damaged pouches, is absorbed
+by good packets, which is the normal-loss convention. (b) Labour and gas/power are
+entered per run. If you later add monthly shared overheads (rent, supervisor pay), allocate
+them to runs pro rata to packets produced that month, and say so. Computing on read
+means a late overhead entry (step 8 arrives after the run) can never leave a stale stored
+number.
+
+Page 12 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+8.6 Order submit (weak network safe)
+
+existing = orderRepo.findByClientUuid(req.clientUuid);
+if (existing != null) return existing;        // 200 with same body: retry or 
+offline-sync replay is harmless
+for line: unitPrice = customerPrice(customer, item) ?? item.sellingPrice;   
+// snapshot the price
+order.status = SUBMITTED; order.orderNo = docSequence.next(ORD, fy);
+
+The mobile client generates the UUID when the order is created, even offline, and the
+queue sync simply POSTs again. clientUuid has a UNIQUE index, so even two simultaneous
+retries cannot create two orders.
+
+8.7 Stock check and approval
+
+// aggregate lines per item first, then:
+available = stock.balance(fgItem);
+shortage  = max(0, requested - available);
+
+GET /stock-check returns the table. POST /approve: if any shortage and allowBackorder is
+false -> 409 with the shortage list. Admin then has three honest options: reduce the
+quantity with PUT (to 88), reject, or approve with allowBackorder = true. Rule to
+document: the check at approval is advisory so the admin can decide; the check at
+dispatch is hard, because StockService refuses negative stock.
+
+Page 13 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+8.8 GST invoice
+
+require(order.status == APPROVED);
+fy  = month >= 4 ? year + '-' + (year+1)%100 : (year-1) + '-' + year%100;   
+// 2026-27
+no  = docSequence.next(INV, fy);          // row-locked counter -> INV/2026-
+27/0001, no gaps
+intra = customer.stateCode.equals(settings.factoryStateCode);   // TN = 33
+for (line : order.lines) {
+  taxable = qty.multiply(rate).setScale(2, HALF_UP);
+  tax     = taxable.multiply(gstRate).divide(100, 2, HALF_UP);
+  if (intra) { cgst = tax.divide(2, 2, HALF_UP); sgst = tax.subtract(cgst); }   
+// halves always add back to tax
+  else       { igst = tax; }
+}
+total = sum(taxable) + sum(cgst) + sum(sgst) + sum(igst);     // no round-
+off, assumption stated
+order.status = INVOICED;
+
+Benchmark: 150 x 50 = 7,500.00; tax 375.00; CGST 187.50 + SGST 187.50; total 7,875.00.
+Distributor B in Karnataka: 120 x 50 = 6,000; IGST 300.00 (or 220.00 on 4,400 if cut to 88
+packets).
+
+8.9 Dispatch
+
+require(invoice.status == POSTED && !dispatched);
+for (line : invoice.lines) stock.post(item, SALE_DISPATCH, -line.qty, 
+avgCost, INVOICE, invoice.id);
+insert dispatches; order.status = DISPATCHED;     // any shortage throws 409 
+and nothing is written
+
+8.10 Payments, outstanding, ageing
+
+invoiceOutstanding = invoice.total - SUM(payments.amount)         (0 if 
+CANCELLED)
+customerOutstanding = SUM(invoiceOutstanding) over customer's invoices
+ageing bucket = today - invoice_date -> 0-30, 31-60, 61-90, 90+   (use 
+balance of each unpaid invoice)
+
+A payment larger than the invoice outstanding returns 409 (assumption: no advance
+payments). Retailer A: 7,875 - 4,000 = 3,875.
+
+Page 14 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+8.11 Cancel with credit note
+Only POSTED invoices. Reason mandatory. Reject with 409 if payments exist (assumption:
+refund handled outside). Create CREDIT_NOTES mirroring the invoice amounts (number
+series CN/2026-27/0001). If it was dispatched, post SALE_RETURN +qty for each line.
+Invoice -> CANCELLED, order -> CANCELLED. Write audit_log. GST report subtracts
+credit notes in the month they are issued.
+
+8.12 Audit trail
+One AuditService.log(entityType, id, action, before, after)  called from the
+services that change documents: order edit, approve/reject, invoice create/cancel, run
+complete, adjustment, master edits. Before and after are JSON snapshots. Do not build
+AOP magic; explicit calls are easier to explain.
+
+8.13 Reports
+Each report is one query returning rows, plus a shared Exporter  that turns rows into
+json, csv, xlsx or pdf. The stock ledger report is the one that proves 'opening + receipts -
+issues = closing':
+
+SELECT item_id,
+  SUM(CASE WHEN movement_date <  :from THEN qty_delta ELSE 0 END)               
+AS opening,
+  SUM(CASE WHEN movement_date BETWEEN :from AND :to AND qty_delta > 0 THEN 
+qty_delta ELSE 0 END) AS receipts,
+  SUM(CASE WHEN movement_date BETWEEN :from AND :to AND qty_delta < 0 THEN -
+qty_delta ELSE 0 END) AS issues,
+  SUM(CASE WHEN movement_date <= :to THEN qty_delta ELSE 0 END)                 
+AS closing
+FROM stock_ledger GROUP BY item_id;
+
+GST summary groups invoice lines by supply_type and gst_rate (taxable, CGST, SGST,
+IGST), splits B2B (customer has GSTIN) from B2C, then subtracts credit notes. That shape
+maps to GSTR-1 tables and the GSTR-3B outward supply figures.
+
+Page 15 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+9. Benchmark walkthrough (your demo script and your 
+integration test)
+
+Step Call What gets written Expected
+
+1 POST /purchases flour 60 kg ledger PURCHASE +60; flour 160 kg
+@45 avg cost 43.1250
+
+2 POST /production-runs DRAFT with planned 40 / flour 120, oil 19.5, spice
+{murukku, 1 batch}, then 10 / 1.2 / pouch 200 / 3.8
+/issue flour 40 kg, oil 10.5 L, carton 10; expected
+spice 1.2 kg output 200; three
+
+PROD_ISSUE rows
+
+3 POST /{id}/complete {188, two PROD_ISSUE, one pouches 306, cartons
+wastage 6, pouches 194, PROD_OUTPUT +188; 21, FG 238; yield
+cartons 9} variances computed -6.00% flagged; oil
+
++5.00% flagged
+
+4 Salesman A: POST /orders, order SUBMITTED status visible to
+Retailer A, 150 salesman
+
+5 stock-check, approve, POST invoice INV/2026-27/0001; 7,500 + 187.50 + 187.50
+/invoice, POST /dispatch SALE_DISPATCH -150 = 7,875; FG 88
+
+6 Salesman B: POST /orders, no ledger change shortage 32; approve
+Distributor B (KA), 120; returns 409; IGST
+stock-check; approve would apply (300.00)
+
+7 POST /payments 4,000 payment row outstanding 3,875
+against the Retailer A invoice
+
+8 POST /production- overhead rows; costing materials 4,055.00 +
+runs/{id}/overheads 1,200 computed 1,800.00 = 5,855.00;
+labour, 600 gas/power; GET /188 = 31.14 per packet;
+run margin 18.86 (37.7%)
+
+9 GET /reports/* for the none all section 4.6 reports,
+month csv/xlsx/pdf
+
+Material cost detail: flour 40 x 43.125 = 1,725.00, oil 10.5 x 140 = 1,470.00, spice 1.2 x 200 =
+240.00, pouches 194 x 2.50 = 485.00, cartons 9 x 15 = 135.00.
+Two differences to explain in the README before a reviewer finds them:
+
+Page 16 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+1. Under the 3% rule the system also flags cartons (9 used vs 10 planned = -10.00%). The
+brief lists only yield and oil, but the flag is correct by the rule. Explain that 188 packets
+at 20 per carton need 9.4 cartons, so the BOM planned figure is for a full 200-packet
+batch.
+
+2. Pouches come out at exactly -3.00% (194 vs 200) and are not flagged because the
+rule is strictly beyond tolerance. State that rule.
+
+10. Tests that win the code-quality 15%
+UnitTest: 10500 ML -> 10.500 L; g to kg; mismatched dimension rejected.
+GstCalculatorTest: 7,500 at 5% intra gives 187.50 + 187.50; inter gives IGST 375; odd
+paisa split still sums to tax.
+VarianceTest: oil +5.00 flagged; exactly 3.00 not flagged; yield -6.00 flagged.
+WeightedAverageTest: (100 x 42 + 60 x 45) / 160 = 43.1250.
+StockServiceTest: negative balance throws and writes no row; ledger sum equals
+balance.
+BenchmarkIT (SpringBootTest + Testcontainers): replays steps 1-9 through MockMvc
+and asserts every row of the section 5 results table. This one test is your proof for the
+30% criterion.
+
+11. How to build it: step-by-step with checkpoints
+Commit after each checkpoint with a clear message (the brief penalises a single 'final
+upload' commit).
+
+1. Skeleton. Spring Boot project, MySQL via docker-compose, Flyway V1 with the full
+schema from section 4. Checkpoint: app starts, tables exist. Commit: chore: project
+skeleton and schema .
+
+2. Auth and roles. Users table, BCrypt, JWT filter, five seeded users, @PreAuthorize.
+Checkpoint: salesman token gets 403 on /stock. You already built this pattern in a
+JWT project, so reuse it.
+
+3. Masters. Items, customers, suppliers, BOM CRUD, settings. Flyway V2 seeds the
+entire section 5 master data and opening stock as OPENING ledger rows. Checkpoint:
+GET /stock shows flour 100, oil 30, spice 5, pouches 500, cartons 30, FG 50.
+
+Page 17 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+4. Ledger and purchase. Unit enum, StockService, purchase endpoint, stock summary
+and ledger endpoints. Checkpoint: benchmark step 1 gives flour 160 and ledger shows
+source.
+
+5. Production. Create, issue, complete, variance, overheads, costing read. Checkpoint:
+steps 2, 3 and 8 produce the exact numbers in section 9.
+
+6. Sales flow. Orders (with clientUuid), stock-check, approve, invoice with GST and
+numbering, dispatch. Checkpoint: steps 4-6.
+
+7. Payments and outstanding. Checkpoint: 3,875.
+8. PDF and reports. Invoice PDF first (Must have), then sales register and stock report
+
+as CSV/Excel (Must have), then GST summary, purchase, production, outstanding
+with ageing.
+
+9. Audit, cancel and credit note, dashboard. Small endpoints, all 'Should have'.
+10. Hardening. BenchmarkIT, README, design note, demo video, deploy. Record the
+
+video by following section 9 in order.
+11. Stretch, only if everything above is green. Pick at most two: low-stock alerts
+
+(reorder_level is already a column) and production planning from pending orders
+(SUM approved quantities minus stock, divided by yield, rounded up to whole
+batches).
+
+12. Interview-proofing
+Add a 500 g pack sharing the same BOM. Insert a new finished item with
+pack_size_g = 500  and the same bom_id . Expected output = bom.yield_packets x
+
+batches x bom.ref_pack_g / item.pack_size_g, so a 40 kg batch gives 80 packets of
+500 g. Packaging lines on the BOM are per packet for the reference pack, so scale
+them by the same ratio. Know this sentence cold.
+Why no stored balance? Two screens updating one number can drift. A sum of
+immutable rows cannot.
+Why is costing computed on read? Overheads arrive after the run; nothing stored
+can go stale.
+What if two admins dispatch the last 88 packets at once? The item row lock in
+StockService.post serialises them; the second gets 409.
+
+Page 18 of 19
+
+
+
+Order-to-Audit System: Backend Architecture, ER Diagram and API Guide
+
+13. README and design note checklist
+README: setup (one docker compose up), test logins per role, stack justification (section
+3), features against Must / Should / Stretch, benchmark table with your numbers and the
+two explanations in section 9, assumptions, known gaps.
+Assumptions to write down: financial year April-March; factory state code 33 (Tamil
+Nadu); GST 5% flat from the item master; no invoice round-off; tolerance 3% and flagged
+only when strictly beyond; packaging consumption recorded at run completion; shortage
+is advisory at approval and hard at dispatch; one payment settles one invoice; no advance
+payments; whole-invoice dispatch only; weighted average costing; overheads entered per
+run; damaged pouches absorbed in good-packet cost.
+Known gaps (honest ones score better than hidden ones): partial dispatch and sales
+returns other than cancellation, batch and expiry tracking, offline sync is idempotent-
+server-side only, no e-invoice or Tally export.
+Design note (2 pages max): the ER diagram from section 4, one paragraph on how stock
+is the sum of the ledger, one paragraph on BOM consumption and variance (8.4), one
+paragraph on costing (8.5). Reuse the text above in your own words.
+
+Page 19 of 19
