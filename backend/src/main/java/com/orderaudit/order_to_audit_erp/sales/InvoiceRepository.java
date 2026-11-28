@@ -1,5 +1,6 @@
 package com.orderaudit.order_to_audit_erp.sales;
 
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
 
@@ -24,4 +25,8 @@ public interface InvoiceRepository extends JpaRepository<Invoice, Long> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT i FROM Invoice i WHERE i.id = :id")
     Optional<Invoice> lockById(@Param("id") Long id);
+
+    /** A customer's invoices issued up to (and including) a date, oldest first. */
+    List<Invoice> findByCustomerIdAndInvoiceDateLessThanEqualOrderByInvoiceDateAscIdAsc(
+            Long customerId, LocalDate asOfDate);
 }
